@@ -37,6 +37,20 @@ CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+-- 抄表复核会话：复核通过（两端唯一）后暂存结果，确认时校验未失效。
+-- pump_fingerprint 记录复核时刻该泵台账行的指纹（行不存在时为 ABSENT），
+-- ledger_generation 记录复核时刻的台账代际（整表替换会递增）。
+CREATE TABLE IF NOT EXISTS review_sessions (
+    token             TEXT PRIMARY KEY,
+    pump_id           TEXT NOT NULL,
+    m                 INTEGER NOT NULL CHECK (m > 0),
+    entry_hours       INTEGER NOT NULL CHECK (entry_hours >= 0),
+    exit_hours        INTEGER NOT NULL CHECK (exit_hours >= entry_hours),
+    pump_fingerprint  TEXT NOT NULL,
+    ledger_generation INTEGER NOT NULL,
+    created_at        TEXT NOT NULL
+);
 """
 
 

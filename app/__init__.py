@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 from flask import (Flask, abort, flash, jsonify, redirect, render_template,
                    request, url_for)
@@ -10,6 +11,20 @@ from . import services
 from .csvio import parse_csv
 from .db import connect, init_db
 from .lifetable import EVENT_LABELS, EVENT_TYPES, PumpRecord
+from .meterreview import parse_review_csv, solve_review
+
+_M_RE = re.compile(r"[0-9]{1,9}")
+
+
+def _decode_upload(raw: bytes) -> str | None:
+    """Decode an uploaded CSV as UTF-8 (with BOM) or GBK; None if neither."""
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            return raw.decode("gbk")
+        except UnicodeDecodeError:
+            return None
 
 
 def create_app(db_path: str | None = None) -> Flask:
@@ -52,14 +67,10 @@ def create_app(db_path: str | None = None) -> Flask:
             flash("请先选择要上传的 CSV 文件", "error")
             return redirect(url_for("index"))
         raw = file.read()
-        try:
-            text = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            try:
-                text = raw.decode("gbk")
-            except UnicodeDecodeError:
-                flash("CSV 编码无法识别，请保存为 UTF-8 后重试", "error")
-                return redirect(url_for("index"))
+        text = _decode_upload(raw)
+        if text is None:
+            flash("CSV 编码无法识别，请保存为 UTF-8 后重试", "error")
+            return redirect(url_for("index"))
         try:
             records = parse_csv(text)
             result = services.replace_ledger(db_conn(), records,
@@ -102,6 +113,7 @@ def create_app(db_path: str | None = None) -> Flask:
                 event_labels=EVENT_LABELS,
                 form=dict(existing) if existing else {},
                 errors=[],
+                review=None,
             )
         form, record, errors = _read_pump_form(request.form,
                                                fixed_id=existing["pump_id"] if existing else None)
@@ -109,6 +121,7 @@ def create_app(db_path: str | None = None) -> Flask:
             return render_template(
                 "pump_form.html", existing=existing, event_types=EVENT_TYPES,
                 event_labels=EVENT_LABELS, form=form, errors=errors,
+                review=None,
             ), 400
         try:
             result = services.upsert_pump(conn, record)
@@ -116,6 +129,7 @@ def create_app(db_path: str | None = None) -> Flask:
             return render_template(
                 "pump_form.html", existing=existing, event_types=EVENT_TYPES,
                 event_labels=EVENT_LABELS, form=form, errors=[str(exc)],
+                review=None,
             ), 400
         except Exception as exc:  # pragma: no cover - defensive
             flash(f"保存失败，已保留原值: {exc}", "error")
@@ -150,6 +164,90 @@ def create_app(db_path: str | None = None) -> Flask:
         if not errors:
             record = PumpRecord(pump_id, entry, exit_hours, event_type)
         return dict(form), record, errors
+
+    # ------------------------------------------------------- meter review
+    @app.route("/pumps/review", methods=["POST"])
+    def pump_review():
+        """抄表复核：M + 抄表 CSV → 入册/出册各自的最小、最大工时。"""
+        conn = db_conn()
+        pump_id = request.form.get("pump_id", "").strip()
+        m_raw = request.form.get("m", "").strip()
+        file = request.files.get("review_csv")
+        errors: list[str] = []
+
+        if not pump_id:
+            errors.append("泵号不能为空")
+        m = None
+        if not _M_RE.fullmatch(m_raw):
+            errors.append("归零周期 M 须为至多 9 位的正整数")
+        else:
+            m = int(m_raw)
+            if m == 0:
+                errors.append("归零周期 M 须大于零")
+
+        rows = None
+        if file is None or file.filename == "":
+            errors.append("请上传按抄表顺序排列的抄表 CSV")
+        else:
+            text = _decode_upload(file.read())
+            if text is None:
+                errors.append("抄表 CSV 编码无法识别，请保存为 UTF-8 后重试")
+            else:
+                try:
+                    rows = parse_review_csv(text)
+                except ValueError as exc:
+                    errors.append(str(exc))
+
+        result = None
+        token = None
+        if not errors and m is not None:
+            result = solve_review(m, rows)
+            if result.feasible and result.unique:
+                try:
+                    token = services.save_review_session(
+                        conn, pump_id, m, result.entry_min, result.exit_min)
+                except ValueError as exc:  # pragma: no cover - defensive
+                    errors.append(str(exc))
+                    result = None
+
+        existing = services.get_pump(conn, pump_id) if pump_id else None
+        review_ctx = {
+            "pump_id": pump_id,
+            "m_raw": m_raw,
+            "filename": file.filename if file else "",
+            "errors": errors,
+            "result": result,
+            "token": token,
+        }
+        status = 400 if errors else 200
+        return render_template(
+            "pump_form.html", existing=existing, event_types=EVENT_TYPES,
+            event_labels=EVENT_LABELS,
+            form=dict(existing) if existing else {"pump_id": pump_id},
+            errors=[], review=review_ctx,
+        ), status
+
+    @app.route("/pumps/review/confirm", methods=["POST"])
+    def pump_review_confirm():
+        """确认采用复核工时：与汇总同一事务生效；失效/失败保留原值。"""
+        token = request.form.get("token", "").strip()
+        event_type = request.form.get("event_type", "")
+        try:
+            result = services.confirm_review_session(db_conn(), token, event_type)
+        except services.ReviewStale as exc:
+            flash(f"复核已失效，未写入任何数据：{exc}", "error")
+            return redirect(url_for("pumps"))
+        except ValueError as exc:
+            flash(f"确认失败，已保留原值: {exc}", "error")
+            return redirect(url_for("pumps"))
+        except Exception as exc:  # pragma: no cover - defensive
+            flash(f"确认失败，已保留原值: {exc}", "error")
+            return redirect(url_for("pumps"))
+        label = "更正" if result["action"] == "updated" else "新增"
+        flash(f"泵 {result['pump_id']} 已按复核结果{label}：入册 "
+              f"{result['entry_hours']:.0f} 小时、出册 {result['exit_hours']:.0f} 小时，"
+              f"台账与汇总已在同一事务内生效", "ok")
+        return redirect(url_for("pumps"))
 
     # ---------------------------------------------------- read-only query page
     @app.route("/query", methods=["GET"])

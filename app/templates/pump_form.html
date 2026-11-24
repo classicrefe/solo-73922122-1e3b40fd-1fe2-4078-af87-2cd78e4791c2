@@ -8,7 +8,8 @@
     <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
   </div>
   {% endif %}
-  <form method="post" class="pump-form">
+  <form method="post" class="pump-form"
+        action="{{ url_for('pump_edit', pump_id=existing.pump_id) if existing else url_for('pump_new') }}">
     <label>泵号
       <input name="pump_id" value="{{ form.get('pump_id', existing.pump_id if existing else '') }}"
              {% if existing %}readonly{% endif %} required>
@@ -37,5 +38,117 @@
     </div>
   </form>
   <p class="hint">只需提交本泵数据；服务端在同一事务内更新该泵并重算汇总，无需读取其他泵明细。</p>
+</section>
+
+<section class="card">
+  <h2>抄表复核（归零表计校正）</h2>
+  <p class="hint">工时表每满 M 小时归零，隔久了抄表可能漏过整圈。填归零周期 M 并上传按抄表顺序排列的
+  抄表 CSV，系统按「累计工时 ÷ M 的余数 = 表显、相邻增量在 0 到所填上限之间、核准值钉死」
+  综合全部读数，推算入册与出册各自能达到的最小、最大工时（区间传播求解，不按圈数逐一试算）；
+  只有两端都唯一时才可确认采用。</p>
+  {% if review and review.errors %}
+  <div class="flash flash-error">
+    <strong>复核输入有误，未产生任何结果：</strong>
+    <ul>{% for e in review.errors %}<li>{{ e }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+  <form method="post" action="{{ url_for('pump_review') }}" enctype="multipart/form-data" class="review-form">
+    {% if existing %}
+    <input type="hidden" name="pump_id" value="{{ existing.pump_id }}">
+    {% else %}
+    <label>泵号
+      <input name="pump_id" value="{{ review.pump_id if review else form.get('pump_id', '') }}" required>
+    </label>
+    {% endif %}
+    <label>归零周期 M（小时，正整数）
+      <input name="m" inputmode="numeric" pattern="[0-9]+"
+             value="{{ review.m_raw if review else '' }}" required>
+    </label>
+    <label>抄表记录 CSV（按抄表顺序）
+      <input type="file" name="review_csv" accept=".csv,text/csv" required>
+    </label>
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">开始复核</button>
+    </div>
+  </form>
+  <details class="help">
+    <summary>抄表 CSV 格式说明 / 示例</summary>
+    <p>必需四列：<code>表显小时</code>、<code>距上次抄表最多运行小时</code>、<code>标记</code>、<code>核准累计工时</code>。</p>
+    <ul>
+      <li>按抄表顺序每行一次抄表；首行「距上次」列留空，第二行起必填；</li>
+      <li>标记列填 <code>入册</code>、<code>出册</code> 各一次，入册行须先于出册行；</li>
+      <li>核准累计工时只填在入册/出册行，且两行至少一行填写；</li>
+      <li>所有工时数据为至多 9 位非负整数，M 为正整数。</li>
+    </ul>
+    <pre>表显小时,距上次抄表最多运行小时,标记,核准累计工时
+120,,,
+340,500,,
+80,900,入册,1080
+150,400,,
+260,200,出册,</pre>
+  </details>
+
+  {% if review and review.result %}
+  {% set r = review.result %}
+  <h3>复核结果（M = {{ r.m }}，文件 {{ review.filename }}）</h3>
+  {% if not r.feasible %}
+  <div class="flash flash-error">
+    <strong>无解：全部读数与核准值无法同时满足，请核对抄表数据后重新复核。</strong>
+    <ul>{% for reason in r.reasons %}<li>{{ reason }}</li>{% endfor %}</ul>
+  </div>
+  {% else %}
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>行号</th><th>表显小时</th><th>距上次上限</th><th>标记</th><th>核准累计工时</th>
+        <th>可行累计工时（最小）</th><th>可行累计工时（最大）</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for row in r.rows %}
+      <tr>
+        <td>{{ row.line_no }}</td>
+        <td>{{ row.display }}</td>
+        <td>{{ row.max_run if row.max_run is not none else '—' }}</td>
+        <td>{{ {'entry': '入册', 'exit': '出册'}.get(row.mark, '') }}</td>
+        <td>{{ row.approved if row.approved is not none else '—' }}</td>
+        <td>{{ row.min_hours }}</td>
+        <td>{{ row.max_hours }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <dl class="meta-grid review-summary">
+    <div><dt>入册（第 {{ r.entry_line }} 行）可达工时</dt>
+      <dd>{{ r.entry_min }} ~ {{ r.entry_max }}</dd></div>
+    <div><dt>出册（第 {{ r.exit_line }} 行）可达工时</dt>
+      <dd>{{ r.exit_min }} ~ {{ r.exit_max }}</dd></div>
+  </dl>
+  {% if r.unique %}
+  <div class="flash flash-ok">入册、出册工时均唯一：入册 <strong>{{ r.entry_min }}</strong> 小时、
+    出册 <strong>{{ r.exit_min }}</strong> 小时，可确认采用。</div>
+  <form method="post" action="{{ url_for('pump_review_confirm') }}" class="review-confirm">
+    <input type="hidden" name="token" value="{{ review.token }}">
+    <label>结束方式
+      <select name="event_type" required>
+        {% for et in event_types %}
+        <option value="{{ et }}" {% if (existing.event_type if existing else 'censored') == et %}selected{% endif %}>
+          {{ event_labels[et] }}（{{ et }}）
+        </option>
+        {% endfor %}
+      </select>
+    </label>
+    <button type="submit" class="btn btn-primary">确认采用复核工时并{{ '更正' if existing else '登记' }}该泵</button>
+  </form>
+  <p class="hint">确认后新工时与汇总在同一事务内生效，失败保留原值；确认前若该泵被更正或台账被
+  整表替换，本次复核自动失效，须重新复核（单独更正其他泵不影响）。</p>
+  {% else %}
+  <div class="flash flash-warn">入册或出册工时仍不唯一（见上方区间），<strong>不能确认</strong>；
+    请补充核准累计工时或更紧的运行上限后重新复核。</div>
+  {% endif %}
+  {% endif %}
+  {% endif %}
 </section>
 {% endblock %}
